@@ -1,0 +1,265 @@
+module baud_rate_generator #(
+    parameter integer BAUD_DIV = 10416
+)(
+    input  logic clock,
+    input  logic reset,
+    output logic baud_tick
+);
+
+    integer cnt;
+
+    always_ff @(posedge clock) begin
+        if (reset) begin
+            cnt <= 0;
+        end else if (cnt == BAUD_DIV-1) begin
+            cnt <= 0;
+        end else begin
+            cnt <= cnt + 1;
+        end
+    end
+
+    assign baud_tick = (cnt == BAUD_DIV-1);
+
+endmodule
+
+module uart_receiver #(
+    parameter integer DBITS = 8,
+    parameter integer SBITS = 1
+)(
+    input  logic clock,
+    input  logic reset,
+    input  logic rx,
+    output logic [DBITS-1:0] data_out,
+    output logic rx_done
+);
+
+    localparam integer BAUD_DIV  = 10416;
+    localparam integer HALF_BAUD = BAUD_DIV/2;
+
+    // FSM states
+    typedef enum logic [1:0] {
+        IDLE,
+        START,
+        DATA,
+        STOP
+    } state_t;
+
+    state_t state;
+
+    integer baud_cnt;
+    integer bit_cnt;
+    logic [DBITS-1:0] shift_reg;
+
+    always_ff @(posedge clock) begin
+        if (reset) begin
+            state     <= IDLE;
+            baud_cnt  <= 0;
+            bit_cnt   <= 0;
+            shift_reg <= 0;
+            data_out  <= 0;
+            rx_done   <= 0;
+        end else begin
+            rx_done <= 1'b0;
+
+            case (state)
+                IDLE: begin
+                    if (rx == 1'b0) begin
+                        state    <= START;
+                        baud_cnt <= 0;
+                    end
+                end
+
+                START: begin
+                    if (baud_cnt == HALF_BAUD-1) begin
+                        if (rx == 1'b0) begin
+                            state    <= DATA;
+                            baud_cnt <= 0;
+                            bit_cnt  <= 0;
+                        end else begin
+                            state <= IDLE;  // false start
+                        end
+                    end else begin
+                        baud_cnt <= baud_cnt + 1;
+                    end
+                end
+
+                DATA: begin
+                    if (baud_cnt == BAUD_DIV-1) begin
+                        baud_cnt <= 0;
+
+                        // LSB-first shift in (correct for UART)
+                        shift_reg <= {rx, shift_reg[DBITS-1:1]};
+
+                        if (bit_cnt == DBITS-1) begin
+                            state <= STOP;
+                        end else begin
+                            bit_cnt <= bit_cnt + 1;
+                        end
+                    end else begin
+                        baud_cnt <= baud_cnt + 1;
+                    end
+                end
+
+                STOP: begin
+                    if (baud_cnt == BAUD_DIV-1) begin
+                        baud_cnt <= 0;
+                        data_out <= shift_reg;
+                        rx_done  <= 1'b1;
+                        state    <= IDLE;
+                    end else begin
+                        baud_cnt <= baud_cnt + 1;
+                    end
+                end
+            endcase
+        end
+    end
+
+endmodule
+
+module control_unit (
+    input  logic clk,
+    input  logic rst,
+    input  logic stop_flag,
+    input  logic tx_done,
+
+    output logic reset_pwm,
+    output logic read_enable,
+    output logic ctrl,
+    output logic [3:0] tx_index,
+    output logic tx_start,
+    output logic done
+);
+    typedef enum logic [1:0] {PRINT1, AWAIT, CONTROL, PRINT2} state_t;
+    state_t state, next_state;
+
+    logic reset_pwm_n, read_enable_n, ctrl_n;
+    logic [3:0] tx_index_n;
+    logic tx_start_n, done_n;
+
+    logic tx_done_d;
+
+    always_ff @(posedge clk or posedge rst) begin
+        if (rst) begin
+            state <= PRINT1;
+            tx_index <= 0;
+            tx_done_d <= 0;
+            reset_pwm <= 0;
+            read_enable <= 0;
+            ctrl <= 0;
+            tx_start <= 0;
+            done <= 0;
+        end else begin
+            tx_done_d <= tx_done;
+            state <= next_state;
+            tx_index <= tx_index_n;
+            reset_pwm <= reset_pwm_n;
+            read_enable <= read_enable_n;
+            ctrl <= ctrl_n;
+            tx_start <= tx_start_n;
+            done <= done_n;
+        end
+    end
+
+    logic tx_done_edge;
+    assign tx_done_edge = (tx_done & ~tx_done_d);
+
+    always_comb begin
+        next_state = state;
+        tx_index_n = tx_index;
+        reset_pwm_n   = 0;
+        read_enable_n = 0;
+        ctrl_n        = 0;
+        tx_start_n    = 0;
+        done_n        = 0;
+
+        case (state)
+            PRINT1: if (tx_done_edge) begin
+                if (tx_index < 6) begin
+                    tx_index_n = tx_index + 1;
+                    tx_start_n = 1;
+                end else begin
+                    tx_index_n = tx_index + 1;
+                    done_n     = 1;
+                    next_state = AWAIT;
+                end
+            end
+
+            AWAIT: if (stop_flag) begin
+                read_enable_n = 1;
+                reset_pwm_n   = 1;
+                next_state    = CONTROL;
+            end
+
+            CONTROL: begin
+                done_n     = 1;
+                ctrl_n     = 1;
+                tx_start_n = 1;
+                next_state = PRINT2;
+            end
+
+            PRINT2: if (tx_done_edge) begin
+                if (tx_index < 15) begin
+                    tx_index_n = tx_index + 1;
+                    tx_start_n = 1;
+                end else begin
+                    tx_index_n = 0;
+                    done_n     = 1;
+                    tx_start_n = 1;
+                    next_state = PRINT1;
+                end
+            end
+        endcase
+    end
+endmodule
+
+module top(
+    input  logic clock,
+    input  logic reset,
+    input  logic rx,
+
+    output logic [7:0] message,
+    output logic reset_pwm,
+    output logic read_enable,
+    output logic ctrl,
+    output logic [3:0] tx_index,
+    output logic tx_start,
+    output logic done
+);
+
+    logic rx_done_meta, rx_done_sync;
+
+    // 2-FF synchronizer for rx_done
+    always_ff @(posedge clock or posedge reset) begin
+        if (reset) begin
+            rx_done_meta <= 0;
+            rx_done_sync <= 0;
+        end else begin
+            rx_done_meta <= uart_rx_done;
+            rx_done_sync <= rx_done_meta;
+        end
+    end
+
+    logic uart_rx_done;
+
+    uart_receiver uart_inst (
+        .clock(clock),
+        .reset(reset),
+        .rx(rx),
+        .data_out(message),
+        .rx_done(uart_rx_done)
+    );
+    
+    control_unit ctrl_inst (
+        .clk(clock),
+        .rst(reset),
+        .stop_flag(1'b1),
+        .tx_done(rx_done_sync),
+
+        .reset_pwm(reset_pwm),
+        .read_enable(read_enable),
+        .ctrl(ctrl),
+        .tx_index(tx_index),
+        .tx_start(tx_start),
+        .done(done)
+    );
+endmodule
